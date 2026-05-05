@@ -1,0 +1,53 @@
+# tcp-commander daemon configuration (personal-use mode)
+#
+# The daemon accepts a single command-line string per request, shell-tokenizes
+# it (no shell is invoked), and runs argv[0] iff its basename is in
+# `allow_command_list`. There is no token authentication and no TLS — the
+# only access control is the IP allowlist below.
+#
+# Run only on a network you trust. Anyone who can reach the listen port can
+# run anything in `allow_command_list`. With `bash` or `docker` whitelisted,
+# that is effectively root on the host. Pin `allow_cidr` tightly.
+
+listen: ":9000"
+
+# Restrict callers by source IP. Empty = allow any (NOT RECOMMENDED).
+allow_cidr:
+  - 127.0.0.1/32
+  - 192.168.0.0/16
+  - 10.0.0.0/8
+
+# Optional: also write JSON logs to a file. Stdout always logs.
+# log_file: /var/log/tcp-commander.log
+
+# Defaults applied to every command. Per-binary overrides go under `limits`.
+defaults:
+  timeout: 30s
+  max_concurrent: 4
+
+# Programs allowed at argv[0]. Either basenames or absolute paths.
+# Each entry is matched by basename, so listing `docker` matches both
+# `docker ...` and `/usr/bin/docker ...`.
+allow_command_list:
+  - df
+  - docker
+  - docker-compose
+  - top
+  - tail
+  - bash         # for running shell scripts: `bash /opt/scripts/foo.sh ...`
+
+# Optional per-binary overrides.
+limits:
+  docker:
+    timeout: 10m       # image pulls / builds
+    max_concurrent: 1
+  docker-compose:
+    timeout: 10m
+    max_concurrent: 1
+  bash:
+    timeout: 10m       # long-running deploy scripts
+    max_concurrent: 2
+  top:
+    timeout: 5m        # streamed `top -b -d 1` is killed at this point
+  tail:
+    timeout: 30m

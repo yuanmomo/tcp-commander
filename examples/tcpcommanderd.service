@@ -1,0 +1,41 @@
+[Unit]
+Description=tcp-commander remote command execution daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# A dedicated, non-root system user. Create it once with:
+#   useradd --system --shell /usr/sbin/nologin --home /var/lib/tcp-commander cmdrunner
+User=cmdrunner
+Group=cmdrunner
+
+ExecStart=/usr/local/bin/tcpcommanderd --config /etc/tcp-commander/config.yaml
+
+# Graceful shutdown: SIGTERM, then SIGKILL after 35s.
+KillSignal=SIGTERM
+TimeoutStopSec=35
+
+# Hardening — adjust if a particular command requires more access.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+
+# Logs go to journald automatically because the binary writes JSON to stdout.
+StandardOutput=journal
+StandardError=journal
+
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
