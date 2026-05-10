@@ -35,7 +35,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	log, closer, err := logging.Setup(cfg.LogFile)
+	log, closer, err := logging.Setup(cfg.LogConfig())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "log setup:", err)
 		os.Exit(1)

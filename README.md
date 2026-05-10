@@ -210,9 +210,35 @@ For long deploys, set `"stream": true` to tail the output live:
 
 ## Logging
 
-JSON to stdout (perfect for `journald` under systemd), and optionally
-duplicated to `log_file`. Each request emits one record with `remote`,
-`id`, `cmd`, `prog`, `rc`, and `elapsed_ms`.
+JSON to stdout (perfect for `journald` under systemd), optionally also
+duplicated to a file with in-process size-based rotation. Each request
+emits a `request start` record on dispatch and a final `request` record
+with `remote`, `id`, `cmd`, `prog`, `rc`, and `elapsed_ms`.
+
+Configure under `logging:` in `config.yaml`:
+
+```yaml
+logging:
+  level: info                # debug, info, warn, error
+  file: /var/log/tcp-commander.log   # empty disables file logging
+  max_size_mb: 100           # rotate at this size; 0 disables rotation
+  max_backups: 7             # keep N rotated files
+  max_age_days: 30           # delete rotated files older than N days
+  compress: true             # gzip rotated files
+```
+
+Rotation is handled in-process (lumberjack), so no `SIGHUP` is required —
+the daemon renames the file and reopens automatically.
+
+The legacy top-level `log_file:` field is still accepted as a shortcut for
+`logging.file:` (no rotation in that form).
+
+Tail the live log:
+
+```sh
+journalctl -u tcpcommanderd -f                 # under systemd
+tail -F /var/log/tcp-commander.log              # if logging.file is set
+```
 
 ## systemd
 

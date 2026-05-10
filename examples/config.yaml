@@ -17,8 +17,16 @@ allow_cidr:
   - 192.168.0.0/16
   - 10.0.0.0/8
 
-# Optional: also write JSON logs to a file. Stdout always logs.
-# log_file: /var/log/tcp-commander.log
+# Logging. Stdout is always written (so journald captures it under
+# systemd). The `file` knob duplicates output into a file with optional
+# in-process rotation. Set `file: ""` to log only to stdout.
+logging:
+  level: info                # debug, info, warn, error
+  file: /var/log/tcp-commander.log
+  max_size_mb: 100           # rotate when the file exceeds this size; 0 disables rotation
+  max_backups: 7             # keep this many rotated files (0 = keep all)
+  max_age_days: 30           # delete rotated files older than N days (0 = keep forever)
+  compress: true             # gzip rotated files
 
 # Defaults applied to every command. Per-binary overrides go under `limits`.
 defaults:
@@ -44,6 +52,7 @@ defaults:
 # `docker ...` and `/usr/bin/docker ...`.
 allow_command_list:
   - df
+  - ls
   - docker
   - docker-compose
   - top

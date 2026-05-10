@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -21,15 +22,30 @@ import (
 // There is intentionally no token auth and no TLS — this build is intended
 // for personal use on a trusted network. Use AllowCIDR to restrict callers.
 type Config struct {
-	Listen           string   `yaml:"listen"`
-	AllowCIDR        []string `yaml:"allow_cidr,omitempty"`
-	LogFile          string   `yaml:"log_file,omitempty"`
-	AllowCommandList []string `yaml:"allow_command_list"`
-	Defaults         Defaults `yaml:"defaults"`
+	Listen           string            `yaml:"listen"`
+	AllowCIDR        []string          `yaml:"allow_cidr,omitempty"`
+	LogFile          string            `yaml:"log_file,omitempty"` // deprecated: use logging.file
+	Logging          Logging           `yaml:"logging,omitempty"`
+	AllowCommandList []string          `yaml:"allow_command_list"`
+	Defaults         Defaults          `yaml:"defaults"`
 	Limits           map[string]Limits `yaml:"limits,omitempty"`
 
 	allowNets    []*net.IPNet    `yaml:"-"`
 	allowedProgs map[string]bool `yaml:"-"`
+}
+
+// Logging configures structured-JSON output. The daemon always writes to
+// stdout (so journald captures it under systemd); when File is set, output
+// is duplicated to that file with optional size-based rotation.
+type Logging struct {
+	LevelStr   string `yaml:"level,omitempty"`        // debug, info, warn, error (default info)
+	File       string `yaml:"file,omitempty"`         // log file path; empty disables file logging
+	MaxSizeMB  int    `yaml:"max_size_mb,omitempty"`  // rotate when file exceeds this; 0 disables rotation
+	MaxBackups int    `yaml:"max_backups,omitempty"`  // keep N rotated files (0 = keep all)
+	MaxAgeDays int    `yaml:"max_age_days,omitempty"` // delete rotated files older than N days (0 = keep forever)
+	Compress   bool   `yaml:"compress,omitempty"`     // gzip rotated files
+
+	level slog.Level `yaml:"-"`
 }
 
 // Defaults applied to every command unless overridden in `limits`.
@@ -165,6 +181,10 @@ func (c *Config) normalize() error {
 		}
 	}
 
+	if err := c.normalizeLogging(); err != nil {
+		return err
+	}
+
 	c.allowedProgs = make(map[string]bool, len(c.AllowCommandList))
 	for _, p := range c.AllowCommandList {
 		if p == "" {
@@ -242,6 +262,45 @@ func (c *Config) KeepAlive() time.Duration { return c.Defaults.keepAlive }
 // OutputCap returns the per-channel cap for non-streaming output buffers.
 // 0 means unbounded.
 func (c *Config) OutputCap() int64 { return c.Defaults.OutputCapBytes }
+
+// LogConfig returns the resolved logging configuration. It honors the new
+// `logging:` block, falling back to the legacy top-level `log_file:` field
+// for the file path when `logging.file` is empty.
+func (c *Config) LogConfig() Logging {
+	out := c.Logging
+	if out.File == "" && c.LogFile != "" {
+		out.File = c.LogFile
+	}
+	return out
+}
+
+// Level returns the parsed slog.Level for this Logging config.
+func (l Logging) Level() slog.Level { return l.level }
+
+func (c *Config) normalizeLogging() error {
+	switch strings.ToLower(strings.TrimSpace(c.Logging.LevelStr)) {
+	case "", "info":
+		c.Logging.level = slog.LevelInfo
+	case "debug":
+		c.Logging.level = slog.LevelDebug
+	case "warn", "warning":
+		c.Logging.level = slog.LevelWarn
+	case "error", "err":
+		c.Logging.level = slog.LevelError
+	default:
+		return fmt.Errorf("invalid logging.level %q (want debug|info|warn|error)", c.Logging.LevelStr)
+	}
+	if c.Logging.MaxSizeMB < 0 {
+		return fmt.Errorf("logging.max_size_mb must be >= 0")
+	}
+	if c.Logging.MaxBackups < 0 {
+		return fmt.Errorf("logging.max_backups must be >= 0")
+	}
+	if c.Logging.MaxAgeDays < 0 {
+		return fmt.Errorf("logging.max_age_days must be >= 0")
+	}
+	return nil
+}
 
 func parseOptionalDuration(raw, label string, fallback time.Duration, dst *time.Duration) error {
 	if raw == "" {
