@@ -97,6 +97,16 @@ func (s *Server) acceptLoop() {
 			_ = conn.Close()
 			continue
 		}
+		// TCP keepalive: long-running commands leave the socket idle for
+		// minutes, and stateful middleboxes (NAT / corp firewalls / cloud
+		// LBs) reap idle TCP. Keepalive both keeps the conntrack entry
+		// warm and detects dead peers so we can free the slot.
+		if tc, ok := conn.(*net.TCPConn); ok {
+			if ka := s.cfg.KeepAlive(); ka > 0 {
+				_ = tc.SetKeepAlive(true)
+				_ = tc.SetKeepAlivePeriod(ka)
+			}
+		}
 		s.conns.Add(1)
 		go s.serve(conn)
 	}
@@ -138,6 +148,10 @@ func (s *Server) serve(conn net.Conn) {
 
 	var inFlight sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel propagates to in-flight commands. We cancel as soon as either
+	// the read loop exits (client EOF / read error) or the server starts
+	// shutting down — whichever fires first. This frees concurrency slots
+	// instead of letting an abandoned 10-minute command run to completion.
 	defer cancel()
 	go func() {
 		<-s.shutdown
@@ -187,6 +201,11 @@ readLoop:
 		s.log.Debug("read error", "remote", remote, "err", err.Error())
 	}
 
+	// Read loop ended (client disconnect / EOF / error). Cancel before
+	// waiting so any in-flight command is signalled to stop instead of
+	// running to completion against a dead client.
+	cancel()
+
 	inFlight.Wait()
 	close(writes)
 	<-writerDone
@@ -216,14 +235,37 @@ func (s *Server) handle(
 	req Request,
 	writes chan<- Response,
 ) {
+	opts, err := s.optionsFor(req)
+	if err != nil {
+		writes <- Response{ID: req.ID, Error: err.Error()}
+		s.logRequest(remote, req, nil, err)
+		return
+	}
+
+	s.log.Info("request start",
+		"remote", remote,
+		"id", req.ID,
+		"cmd", req.Cmd,
+		"stream", req.Stream,
+		"timeout_override", req.Timeout,
+	)
+
 	var streamFn func(command.StreamEvent)
+	var hbStop chan struct{}
 	if req.Stream {
 		streamFn = func(ev command.StreamEvent) {
 			writes <- Response{ID: req.ID, Stream: ev.Channel, Data: ev.Data}
 		}
+		if hb := s.cfg.Heartbeat(); hb > 0 {
+			hbStop = make(chan struct{})
+			go s.heartbeat(req.ID, hb, hbStop, writes)
+		}
 	}
 
-	res, err := s.exec.Run(ctx, req.Cmd, streamFn)
+	res, err := s.exec.Run(ctx, req.Cmd, streamFn, opts)
+	if hbStop != nil {
+		close(hbStop)
+	}
 	if err != nil {
 		writes <- Response{ID: req.ID, Error: err.Error()}
 		s.logRequest(remote, req, nil, err)
@@ -244,6 +286,51 @@ func (s *Server) handle(
 	s.logRequest(remote, req, res, nil)
 }
 
+// optionsFor parses optional per-request knobs and validates them against
+// the daemon's caps.
+func (s *Server) optionsFor(req Request) (command.Options, error) {
+	var opts command.Options
+	if req.Timeout == "" {
+		return opts, nil
+	}
+	d, err := time.ParseDuration(req.Timeout)
+	if err != nil {
+		return opts, fmt.Errorf("invalid timeout %q: %w", req.Timeout, err)
+	}
+	if d <= 0 {
+		return opts, fmt.Errorf("timeout must be > 0")
+	}
+	max := s.cfg.MaxTimeout()
+	if max <= 0 {
+		return opts, fmt.Errorf("per-request timeout overrides are disabled")
+	}
+	if d > max {
+		return opts, fmt.Errorf("timeout %s exceeds max_timeout %s", d, max)
+	}
+	opts.Timeout = d
+	return opts, nil
+}
+
+// heartbeat emits a liveness frame every interval until stop is closed.
+// Used for streaming requests so an idle stream still keeps the socket warm
+// and gives clients a positive signal that the daemon is alive.
+func (s *Server) heartbeat(id string, interval time.Duration, stop <-chan struct{}, writes chan<- Response) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			select {
+			case writes <- Response{ID: id, Heartbeat: true}:
+			case <-stop:
+				return
+			}
+		}
+	}
+}
+
 func (s *Server) logRequest(
 	remote string,
 	req Request,
@@ -259,6 +346,9 @@ func (s *Server) logRequest(
 		attrs = append(attrs, "prog", res.Prog, "rc", res.RC, "elapsed_ms", res.ElapsedMs)
 		if res.TimedOut {
 			attrs = append(attrs, "timed_out", true)
+		}
+		if res.Truncated {
+			attrs = append(attrs, "truncated", true)
 		}
 	}
 	if err != nil {

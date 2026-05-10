@@ -23,7 +23,21 @@ allow_cidr:
 # Defaults applied to every command. Per-binary overrides go under `limits`.
 defaults:
   timeout: 30s
-  max_concurrent: 4
+  max_concurrent: 8
+  # Upper bound for the per-request `timeout` field (clients can ask for a
+  # longer run via the protocol). Set to 0 to forbid per-request overrides.
+  max_timeout: 1h
+  # Heartbeat frame interval for streaming requests. 0 disables.
+  heartbeat: 30s
+  # Grace window between SIGTERM and SIGKILL when a command is cancelled
+  # (timeout, server shutdown, or client disconnect).
+  kill_grace: 10s
+  # TCP keepalive period on accepted connections. 0 disables.
+  keepalive: 30s
+  # Per-channel cap (stdout / stderr) for non-streaming output buffers.
+  # Output past the cap is replaced with a truncation marker. Use streaming
+  # for commands that produce large output.
+  output_cap_bytes: 4194304   # 4 MiB
 
 # Programs allowed at argv[0]. Either basenames or absolute paths.
 # Each entry is matched by basename, so listing `docker` matches both

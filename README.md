@@ -53,6 +53,14 @@ with shellwords (handles quotes, escapes), then `argv[0]` is matched against
 like `;`, `|`, `$(...)`, backticks, globs, and env-var substitution **are
 literal characters** to the program, not interpreted by anything.
 
+Optional fields:
+
+- `"stream": true` — switch to line-by-line streaming output (see below).
+- `"timeout": "20m"` — override the per-binary timeout for this single
+  request. Bounded by `defaults.max_timeout` in config; values past the cap
+  are rejected. Useful for one-off long jobs without editing the daemon
+  config.
+
 ### Response
 
 ```json
@@ -82,6 +90,16 @@ Add `"stream": true` to a request to receive output line-by-line:
 
 The final frame always carries `rc` and `elapsed_ms`. Long-running streams
 are stopped by the per-binary timeout from the config.
+
+While a streaming command runs, the daemon also emits periodic heartbeat
+frames so an idle stream still keeps the socket warm:
+
+```json
+< {"id": "t1", "heartbeat": true}
+```
+
+Clients should treat heartbeat frames as a no-op liveness signal. The
+interval is set by `defaults.heartbeat` (default 30s, 0 disables).
 
 ### Built-in `ping`
 
@@ -122,6 +140,11 @@ log_file: /var/log/tcp-commander.log # optional; stdout always logs
 defaults:
   timeout: 30s
   max_concurrent: 4
+  max_timeout: 1h          # cap for per-request `timeout` overrides
+  heartbeat: 30s           # streaming-mode liveness frames
+  kill_grace: 10s          # SIGTERM → SIGKILL grace on cancel/timeout
+  keepalive: 30s           # TCP keepalive on accepted connections
+  output_cap_bytes: 4194304   # 4 MiB cap per channel for non-streaming
 
 allow_command_list:                  # programs allowed at argv[0]
   - df
@@ -148,6 +171,28 @@ Notes:
 - `defaults.max_concurrent` of 0 means unlimited.
 - When `max_concurrent` is reached, the daemon returns
   `max concurrent reached` instead of queueing.
+- `defaults.max_timeout` (default 1h) caps the per-request `timeout`
+  field. Set to `0` to forbid per-request overrides entirely.
+- `defaults.kill_grace` (default 10s) is the window between SIGTERM and
+  SIGKILL when a command is cancelled (timeout, server shutdown, or
+  client disconnect) — long enough for deploy scripts to clean up.
+- `defaults.output_cap_bytes` (default 4 MiB) limits how much stdout/stderr
+  a non-streaming run will buffer in memory. Output past the cap is
+  replaced with a `[tcp-commander: output truncated]` marker. Use
+  `"stream": true` for commands that produce more output than this.
+
+### Long-running commands (minutes-scale)
+
+For commands that take minutes (deploys, image pulls, etc.):
+
+- Set a per-binary `limits.<name>.timeout` larger than the expected runtime,
+  or pass a per-request `"timeout": "20m"` (bounded by `max_timeout`).
+- Prefer `"stream": true` — you get live output, you find out about errors
+  immediately, and heartbeat frames keep the socket warm through NATs and
+  stateful firewalls.
+- If the client disconnects, the daemon now cancels the running command
+  and frees the concurrency slot (rather than running it to completion
+  against a dead client).
 
 ### Running bash scripts
 

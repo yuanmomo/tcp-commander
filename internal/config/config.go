@@ -36,7 +36,17 @@ type Config struct {
 type Defaults struct {
 	TimeoutStr       string `yaml:"timeout"`
 	MaxConcurrent    int    `yaml:"max_concurrent"`
-	timeout          time.Duration
+	MaxTimeoutStr    string `yaml:"max_timeout,omitempty"`
+	HeartbeatStr     string `yaml:"heartbeat,omitempty"`
+	KillGraceStr     string `yaml:"kill_grace,omitempty"`
+	KeepAliveStr     string `yaml:"keepalive,omitempty"`
+	OutputCapBytes   int64  `yaml:"output_cap_bytes,omitempty"`
+
+	timeout      time.Duration
+	maxTimeout   time.Duration
+	heartbeat    time.Duration
+	killGrace    time.Duration
+	keepAlive    time.Duration
 }
 
 // Limits is the per-binary override for timeout / concurrency.
@@ -53,6 +63,26 @@ const DefaultTimeout = 30 * time.Second
 
 // DefaultListen is the default listen address.
 const DefaultListen = ":9000"
+
+// DefaultMaxTimeout caps the per-request timeout override that clients may
+// pass in their request. 0 in config disables per-request overrides.
+const DefaultMaxTimeout = 1 * time.Hour
+
+// DefaultHeartbeat is the interval at which the daemon emits liveness frames
+// on streaming requests. 0 disables heartbeats.
+const DefaultHeartbeat = 30 * time.Second
+
+// DefaultKillGrace is how long the daemon waits after sending SIGTERM before
+// escalating to SIGKILL on timeout / cancellation.
+const DefaultKillGrace = 10 * time.Second
+
+// DefaultKeepAlive is the TCP keepalive period set on accepted connections.
+// 0 disables keepalive.
+const DefaultKeepAlive = 30 * time.Second
+
+// DefaultOutputCapBytes caps the per-channel (stdout/stderr) output buffer
+// for non-streaming requests. 0 disables the cap.
+const DefaultOutputCapBytes = 4 * 1024 * 1024
 
 // Load reads and validates a config file from disk.
 func Load(path string) (*Config, error) {
@@ -96,6 +126,25 @@ func (c *Config) normalize() error {
 			return fmt.Errorf("defaults.timeout must be > 0")
 		}
 		c.Defaults.timeout = d
+	}
+
+	if err := parseOptionalDuration(c.Defaults.MaxTimeoutStr, "defaults.max_timeout", DefaultMaxTimeout, &c.Defaults.maxTimeout); err != nil {
+		return err
+	}
+	if err := parseOptionalDuration(c.Defaults.HeartbeatStr, "defaults.heartbeat", DefaultHeartbeat, &c.Defaults.heartbeat); err != nil {
+		return err
+	}
+	if err := parseOptionalDuration(c.Defaults.KillGraceStr, "defaults.kill_grace", DefaultKillGrace, &c.Defaults.killGrace); err != nil {
+		return err
+	}
+	if err := parseOptionalDuration(c.Defaults.KeepAliveStr, "defaults.keepalive", DefaultKeepAlive, &c.Defaults.keepAlive); err != nil {
+		return err
+	}
+	if c.Defaults.OutputCapBytes < 0 {
+		return fmt.Errorf("defaults.output_cap_bytes must be >= 0")
+	}
+	if c.Defaults.OutputCapBytes == 0 {
+		c.Defaults.OutputCapBytes = DefaultOutputCapBytes
 	}
 
 	if c.Limits == nil {
@@ -174,4 +223,38 @@ func (c *Config) MaxConcurrentFor(prog string) int {
 		return *lim.MaxConcurrent
 	}
 	return c.Defaults.MaxConcurrent
+}
+
+// MaxTimeout returns the upper bound for per-request timeout overrides.
+// A zero value means clients may not override the per-binary timeout.
+func (c *Config) MaxTimeout() time.Duration { return c.Defaults.maxTimeout }
+
+// Heartbeat returns the streaming-heartbeat interval. 0 disables.
+func (c *Config) Heartbeat() time.Duration { return c.Defaults.heartbeat }
+
+// KillGrace returns how long to wait between SIGTERM and SIGKILL.
+func (c *Config) KillGrace() time.Duration { return c.Defaults.killGrace }
+
+// KeepAlive returns the TCP keepalive period for accepted connections.
+// 0 disables keepalive.
+func (c *Config) KeepAlive() time.Duration { return c.Defaults.keepAlive }
+
+// OutputCap returns the per-channel cap for non-streaming output buffers.
+// 0 means unbounded.
+func (c *Config) OutputCap() int64 { return c.Defaults.OutputCapBytes }
+
+func parseOptionalDuration(raw, label string, fallback time.Duration, dst *time.Duration) error {
+	if raw == "" {
+		*dst = fallback
+		return nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return fmt.Errorf("invalid %s %q: %w", label, raw, err)
+	}
+	if d < 0 {
+		return fmt.Errorf("%s must be >= 0", label)
+	}
+	*dst = d
+	return nil
 }

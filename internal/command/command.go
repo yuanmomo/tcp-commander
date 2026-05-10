@@ -5,7 +5,6 @@ package command
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/mattn/go-shellwords"
@@ -36,6 +36,7 @@ type Result struct {
 	Stderr    string
 	ElapsedMs int64
 	TimedOut  bool
+	Truncated bool
 	Argv      []string
 	Prog      string
 }
@@ -44,6 +45,12 @@ type Result struct {
 type StreamEvent struct {
 	Channel string // "stdout" or "stderr"
 	Data    string
+}
+
+// Options tunes a single Run. Zero values mean "use the executor's config".
+type Options struct {
+	// Timeout, if > 0, overrides the per-binary timeout for this run.
+	Timeout time.Duration
 }
 
 // Executor parses and runs allow-listed command strings.
@@ -62,11 +69,19 @@ func New(cfg *config.Config) *Executor {
 // Run parses line, checks the allow list, and executes the resulting argv.
 // If onStream is non-nil the child's stdout/stderr are streamed line-by-line
 // via onStream; in that case the returned Result has empty Stdout/Stderr.
+//
+// An optional Options value tunes this single run (e.g. per-request timeout).
 func (e *Executor) Run(
 	ctx context.Context,
 	line string,
 	onStream func(StreamEvent),
+	opts ...Options,
 ) (*Result, error) {
+	var opt Options
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+
 	argv, err := shellwords.Parse(line)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrParse, err)
@@ -103,6 +118,9 @@ func (e *Executor) Run(
 	}
 
 	timeout := e.cfg.TimeoutFor(base)
+	if opt.Timeout > 0 {
+		timeout = opt.Timeout
+	}
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -110,7 +128,19 @@ func (e *Executor) Run(
 	start := time.Now()
 	cmd := exec.CommandContext(runCtx, resolved, argv[1:]...)
 
-	var outBuf, errBuf bytes.Buffer
+	// Graceful kill: send SIGTERM on context cancel and escalate to SIGKILL
+	// after KillGrace if the child hasn't exited. This lets deploy scripts
+	// clean up on timeout / shutdown / client disconnect.
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			return cmd.Process.Signal(syscall.SIGTERM)
+		}
+		return nil
+	}
+	cmd.WaitDelay = e.cfg.KillGrace()
+
+	outBuf := newCappedBuffer(e.cfg.OutputCap())
+	errBuf := newCappedBuffer(e.cfg.OutputCap())
 	var wg sync.WaitGroup
 
 	if streaming {
@@ -129,8 +159,8 @@ func (e *Executor) Run(
 		go streamLines(stdoutPipe, "stdout", onStream, &wg)
 		go streamLines(stderrPipe, "stderr", onStream, &wg)
 	} else {
-		cmd.Stdout = &outBuf
-		cmd.Stderr = &errBuf
+		cmd.Stdout = outBuf
+		cmd.Stderr = errBuf
 		if err := cmd.Start(); err != nil {
 			return nil, fmt.Errorf("start: %w", err)
 		}
@@ -146,6 +176,7 @@ func (e *Executor) Run(
 	if !streaming {
 		res.Stdout = outBuf.String()
 		res.Stderr = errBuf.String()
+		res.Truncated = outBuf.truncated || errBuf.truncated
 	}
 
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
@@ -156,6 +187,18 @@ func (e *Executor) Run(
 				res.Stderr += "\n"
 			}
 			res.Stderr += "tcp-commander: timeout after " + timeout.String() + "\n"
+		}
+		return res, nil
+	}
+
+	// Parent ctx cancelled (client disconnected / server shutdown).
+	if errors.Is(runCtx.Err(), context.Canceled) {
+		res.RC = -1
+		if !streaming {
+			if res.Stderr != "" && res.Stderr[len(res.Stderr)-1] != '\n' {
+				res.Stderr += "\n"
+			}
+			res.Stderr += "tcp-commander: cancelled\n"
 		}
 		return res, nil
 	}
@@ -182,6 +225,49 @@ func (e *Executor) sem(name string, n int) chan struct{} {
 	}
 	return s
 }
+
+// cappedBuffer is an io.Writer that caps the total bytes it stores. Writes
+// past the cap are dropped (the underlying program still gets EOF on its
+// pipe only when we close it; in practice it just keeps writing into a
+// no-op writer). When truncation occurs, the first byte after the cap is
+// replaced by a marker line so callers can tell the output was clipped.
+type cappedBuffer struct {
+	cap       int64
+	written   int64
+	buf       []byte
+	truncated bool
+}
+
+func newCappedBuffer(cap int64) *cappedBuffer {
+	return &cappedBuffer{cap: cap}
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	if c.cap <= 0 {
+		c.buf = append(c.buf, p...)
+		c.written += int64(n)
+		return n, nil
+	}
+	remaining := c.cap - c.written
+	if remaining > 0 {
+		take := int64(n)
+		if take > remaining {
+			take = remaining
+		}
+		c.buf = append(c.buf, p[:take]...)
+		c.written += take
+	}
+	if c.written >= c.cap && !c.truncated {
+		c.truncated = true
+		c.buf = append(c.buf, []byte("\n[tcp-commander: output truncated]\n")...)
+	}
+	// Always claim we wrote everything so the child process is never
+	// blocked by a backed-up pipe.
+	return n, nil
+}
+
+func (c *cappedBuffer) String() string { return string(c.buf) }
 
 func streamLines(r io.Reader, channel string, onStream func(StreamEvent), wg *sync.WaitGroup) {
 	defer wg.Done()
