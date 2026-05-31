@@ -26,4 +26,4 @@ config.local.yaml
 .DS_Store
 Thumbs.db
 
-.claude
+settings.local.json
